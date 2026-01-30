@@ -184,7 +184,7 @@ if [ "${IS_BLACKWELL}" = false ]; then
 		cat >>"${CONDA_ENV_PATH}/etc/conda/activate.d/cutile_env.sh" <<EOF
 
 # Hopper hack: use CuPy-based compatibility layer for non-Blackwell GPUs
-export CUTILE_HACK_HOPPER_DIR="${PROJECT_ROOT}/cutile-tutorial/hack-hopper"
+export CUTILE_HACK_HOPPER_DIR="${PROJECT_ROOT}/utils/hack-hopper"
 export PYTHONPATH="\${CUTILE_HACK_HOPPER_DIR}:\${PYTHONPATH}"
 EOF
 
@@ -200,7 +200,7 @@ fi
 unset CUTILE_HACK_HOPPER_DIR
 EOF
 		echo "    Hopper hack installed to conda environment activation scripts."
-		echo "    hack-hopper path: ${PROJECT_ROOT}/cutile-tutorial/hack-hopper"
+		echo "    hack-hopper path: ${PROJECT_ROOT}/utils/hack-hopper"
 	fi
 fi
 

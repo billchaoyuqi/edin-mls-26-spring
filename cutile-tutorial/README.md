@@ -21,7 +21,7 @@ This creates a conda environment named `mls` with:
 
 ```bash
 conda activate mls
-source cutile-tutorial/hack.sh  # Run from project root
+source utils/hack.sh  # Run from project root
 ```
 
 ## Running Tutorials
@@ -40,7 +40,7 @@ python cutile-tutorial/1-vectoradd/vectoradd.py
 
 ```bash
 # From project root
-source cutile-tutorial/hack.sh
+source utils/hack.sh
 
 # Run cuTile tutorials
 python cutile-tutorial/1-vectoradd/vectoradd.py
