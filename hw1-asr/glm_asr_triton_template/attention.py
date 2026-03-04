@@ -53,17 +53,40 @@ def attention_scores_kernel(
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
 
-    # ============================================================================
-    # TODO: Implement attention score computation
-    # ============================================================================
-    #
-    # Step 1: Load query vector for this position
-    # Step 2: Load all keys for this batch_head
-    # Step 3: Compute dot-product scores and scale
-    # Step 4: Store scores
+    # 偏移量定义
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
 
-    # YOUR CODE HERE
-    pass
+    # Step 1: 加载当前查询位置的 Query 向量 (1, head_dim)
+    q = tl.load(
+        q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
+        mask=offs_d < head_dim,
+        other=0.0,
+    )
+
+    # Step 2: 加载该 Head 下的所有 Keys (seq_k, head_dim)
+    k = tl.load(
+        k_ptr
+        + pid_bh * stride_k0
+        + offs_k[:, None] * stride_k1
+        + offs_d[None, :] * stride_k2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+
+    # Step 3: 计算点积分数并缩放 (Score = Q @ K^T * scale)
+    # k * q[None, :] 会进行广播乘法，然后在 head_dim 维度求和
+    scores = tl.sum(k * q[None, :], axis=1) * scale
+
+    # Step 4: 存储分数
+    tl.store(
+        scores_ptr
+        + pid_bh * stride_s0
+        + pid_q * stride_s1
+        + offs_k * stride_s2,
+        scores,
+        mask=offs_k < seq_k,
+    )
 
 
 @triton.jit
@@ -73,18 +96,22 @@ def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr
     Grid: (batch_heads * seq_q,)
     """
     row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < seq_k
 
-    # ============================================================================
-    # TODO: Implement softmax
-    # ============================================================================
-    #
-    # Step 1: Load scores row with masking
-    # Step 2: Subtract max for stability
-    # Step 3: Compute exp and normalize
-    # Step 4: Store back
+    # Step 1: 加载一行分数，mask 掉越界部分
+    s = tl.load(scores_ptr + row * stride_s + offs, mask=mask, other=-float("inf"))
 
-    # YOUR CODE HERE
-    pass
+    # Step 2: 减去最大值以保证数值稳定性 (防止 exp 溢出)
+    s = s - tl.max(s, axis=0)
+
+    # Step 3: 计算 exp 和归一化
+    exp_s = tl.exp(s)
+    denom = tl.sum(exp_s, axis=0)
+    out = exp_s / denom
+
+    # Step 4: 写回原处
+    tl.store(scores_ptr + row * stride_s + offs, out, mask=mask)
 
 
 @triton.jit
@@ -113,17 +140,42 @@ def attention_output_kernel(
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
 
-    # ============================================================================
-    # TODO: Implement attention output computation
-    # ============================================================================
-    #
-    # Step 1: Load attention weights for this query
-    # Step 2: Load all values for this batch_head
-    # Step 3: Compute weighted sum
-    # Step 4: Store output
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
 
-    # YOUR CODE HERE
-    pass
+    # Step 1: 加载该 Query 对应的所有 Attention 权重 (seq_k,)
+    w = tl.load(
+        attn_ptr
+        + pid_bh * stride_w0
+        + pid_q * stride_w1
+        + offs_k * stride_w2,
+        mask=offs_k < seq_k,
+        other=0.0,
+    )
+
+    # Step 2: 加载该 Head 下的所有 Values (seq_k, head_dim)
+    v = tl.load(
+        v_ptr
+        + pid_bh * stride_v0
+        + offs_k[:, None] * stride_v1
+        + offs_d[None, :] * stride_v2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+
+    # Step 3: 计算加权和 (Output = Weights @ V)
+    # v * w[:, None] 将权重应用到每一行 Value 上，然后在 seq_k 维度求和
+    out = tl.sum(v * w[:, None], axis=0)
+
+    # Step 4: 存储输出
+    tl.store(
+        output_ptr
+        + pid_bh * stride_o0
+        + pid_q * stride_o1
+        + offs_d * stride_o2,
+        out,
+        mask=offs_d < head_dim,
+    )
 
 
 @triton.jit
