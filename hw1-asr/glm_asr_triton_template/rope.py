@@ -198,6 +198,9 @@ def _apply_rope_single(
     sin = sin[:seq_len]
 
     # 将维度拆分为两半：[x1, x2] -> [-x2, x1]
+    cos = cos[:, :half_dim]
+    sin = sin[:, :half_dim]
+
     x1 = x[..., :half_dim]
     x2 = x[..., half_dim : half_dim * 2]
 
