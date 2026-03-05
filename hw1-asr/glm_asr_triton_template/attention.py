@@ -17,9 +17,20 @@ def get_stream():
     return None
 
 # ============================================================================
-# Triton Kernels for Attention (FlashAttention Fused)
+# Triton Kernels for Attention (FlashAttention Fused + Autotune)
 # ============================================================================
 
+@triton.autotune(
+    configs=[
+        # 针对长序列的配置 (Prefill)
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
+        # 针对中等序列的配置
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+        # 针对极短序列的配置 (Decode 阶段 M=1)
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16}, num_warps=2, num_stages=2),
+    ],
+    key=['Seq_Q', 'Seq_K'], # 当序列长度变化时触发重新调优
+)
 @triton.jit
 def flash_attn_fused_kernel(
     Q, K, V, Out,
@@ -135,6 +146,9 @@ def next_power_of_two(x: int) -> int:
 
 MAX_ATTENTION_DIM = 256
 
+# 全局变量控制打印，防止刷屏
+_PRINTED_ATTN_AUTOTUNE = False
+
 def scaled_dot_product_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -143,6 +157,7 @@ def scaled_dot_product_attention(
     is_causal: bool = False,
     scale: Optional[float] = None,
 ) -> torch.Tensor:
+    global _PRINTED_ATTN_AUTOTUNE
     batch, num_heads, seq_q, head_dim = q.shape
     _, _, seq_k, _ = k.shape
 
@@ -161,11 +176,8 @@ def scaled_dot_product_attention(
         output = torch.empty_like(q)
         head_dim_padded = next_power_of_two(head_dim)
 
-        # 调优 (Tuning): 使用 32x32 防止超限并优化生成阶段的小序列
-        BLOCK_M = 32
-        BLOCK_N = 32
-
-        grid = (batch * num_heads, triton.cdiv(seq_q, BLOCK_M))
+        # 改为使用 lambda 接收 autotune 的动态 META
+        grid = lambda META: (batch * num_heads, triton.cdiv(seq_q, META['BLOCK_M']))
 
         flash_attn_fused_kernel[grid](
             q, k, v, output,
@@ -176,12 +188,15 @@ def scaled_dot_product_attention(
             output.stride(0), output.stride(1), output.stride(2), output.stride(3),
             seq_q, seq_k, head_dim,
             is_causal=is_causal,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
             BLOCK_D=head_dim_padded,
-            num_warps=4,
-            num_stages=2
+            # 注意：删除了显式传入的 BLOCK_M, BLOCK_N, num_warps, num_stages
         )
+
+        # 打印调优结果
+        if not _PRINTED_ATTN_AUTOTUNE and flash_attn_fused_kernel.best_config is not None:
+            print(f"[Autotune] FlashAttention Kernel for Seq_Q={seq_q}, Seq_K={seq_k} selected config: {flash_attn_fused_kernel.best_config}")
+            _PRINTED_ATTN_AUTOTUNE = True
+
         return output
 
     # Fallback to pure PyTorch logic
