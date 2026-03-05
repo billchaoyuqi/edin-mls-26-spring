@@ -660,7 +660,7 @@ class Linear:
     TILE_N = 64
     TILE_K = 32
 
-    BACKEND = "torch"
+    BACKEND = "triton"
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         self.in_features = in_features
@@ -676,18 +676,20 @@ class Linear:
 
     def _ensure_weight_prepared(self):
         """Cache transposed and padded weight for Triton kernel."""
-        if self._weight_t_padded is None:
+        if self._weight_t_padded is None or self._weight_t_padded.device != device:
             K = self.in_features
             N = self.out_features
+            # 预计算对齐后的维度
             self._K_padded = pad_to_multiple(K, self.TILE_K)
             self._N_padded = pad_to_multiple(N, self.TILE_N)
 
-            weight_t = self.weight.t().contiguous()
+            weight_t = self.weight.t().contiguous().to(device)
+            # 一次性完成 Padding，不再在 forward 里做
             if self._K_padded > K or self._N_padded > N:
                 weight_pad = torch.zeros(
                     (self._K_padded, self._N_padded),
                     dtype=torch.float32,
-                    device=weight_t.device,
+                    device=device,
                 )
                 weight_pad[:K, :N] = weight_t
                 self._weight_t_padded = weight_pad
@@ -697,10 +699,10 @@ class Linear:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if Linear.BACKEND in ("torch", "cublas"):
             return self._forward_torch(x)
-        if Linear.BACKEND == "triton":
-            return self._forward_triton(x)
+
         M = int(np.prod(x.shape[:-1]))
-        if M >= self.TILE_M and x.is_cuda:
+        # 即使 M 很小也可以跑 Triton，只要我们去掉了拷贝开销
+        if x.is_cuda:
             return self._forward_triton(x)
         return self._forward_torch(x)
 
@@ -733,56 +735,31 @@ class Linear:
         N = self.out_features
 
         x_2d = x.reshape(M, K).to(torch.float32).contiguous()
+        self._ensure_weight_prepared(x.device)
 
-        if self.weight.device != x.device:
-            self.weight = self.weight.to(x.device)
-            self._weight_t_padded = None
-        self._ensure_weight_prepared()
-
-        M_padded = pad_to_multiple(M, self.TILE_M)
-
-        if M_padded > M or self._K_padded > K:
-            x_padded = torch.zeros(
-                (M_padded, self._K_padded),
-                dtype=torch.float32,
-                device=x.device,
-            )
-            x_padded[:M, :K] = x_2d
-        else:
-            x_padded = x_2d
-
-        output = torch.zeros(
-            (M_padded, self._N_padded), dtype=torch.float32, device=x.device
-        )
+        # 关键修正：不再创建 x_padded，直接使用 x_2d，靠 Kernel 里的 mask 处理
+        output = torch.empty((M, N), dtype=torch.float32, device=x.device)
 
         grid = (
-            triton.cdiv(M_padded, self.TILE_M),
-            triton.cdiv(self._N_padded, self.TILE_N),
+            triton.cdiv(M, self.TILE_M),
+            triton.cdiv(N, self.TILE_N),
         )
         linear_kernel_tf32[grid](
-            x_padded,
+            x_2d,
             self._weight_t_padded,
             output,
-            M_padded,
-            self._N_padded,
-            self._K_padded,
-            x_padded.stride(0),
-            x_padded.stride(1),
-            self._weight_t_padded.stride(0),
-            self._weight_t_padded.stride(1),
-            output.stride(0),
-            output.stride(1),
+            M, N, K, # 传入真实尺寸
+            x_2d.stride(0), x_2d.stride(1),
+            self._weight_t_padded.stride(0), self._weight_t_padded.stride(1),
+            output.stride(0), output.stride(1),
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=4
         )
 
-        output = output[:M, :N]
-
         if self.has_bias and self.bias_param is not None:
-            if self.bias_param.device != x.device:
-                self.bias_param = self.bias_param.to(x.device)
-            output = output + self.bias_param
+            output += self.bias_param.to(x.device)
 
         return output.reshape(*batch_dims, self.out_features)
 
@@ -875,17 +852,10 @@ class MLP:
         use_gating: bool = True,
     ):
         self.use_gating = use_gating
-        self.act_fn = get_activation(activation)
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.bias_enabled = bias
-
-        if use_gating:
-            self.gate_proj = Linear(hidden_size, intermediate_size, bias=bias)
-            self.up_proj = Linear(hidden_size, intermediate_size, bias=bias)
-        else:
-            self.up_proj = Linear(hidden_size, intermediate_size, bias=bias)
-
+        self.gate_proj = Linear(hidden_size, intermediate_size, bias=bias)
+        self.up_proj = Linear(hidden_size, intermediate_size, bias=bias)
         self.down_proj = Linear(intermediate_size, hidden_size, bias=bias)
 
         self._gate_weight_t = None
@@ -893,16 +863,25 @@ class MLP:
 
     def _prepare_fused_weights(self):
         """Prepare pre-transposed weights for fused kernel."""
-        if self._gate_weight_t is None and self.use_gating:
-            if self.gate_proj.weight.device != self.up_proj.weight.device:
-                self.up_proj.weight = self.up_proj.weight.to(self.gate_proj.weight.device)
-            self._gate_weight_t = self.gate_proj.weight.t().contiguous()
-            self._up_weight_t = self.up_proj.weight.t().contiguous()
+        if self._gate_weight_t is None or self._gate_weight_t.device != device:
+            K, N = self.hidden_size, self.intermediate_size
+            K_pad = pad_to_multiple(K, self.TILE_K)
+            N_pad = pad_to_multiple(N, self.TILE_N)
+
+            gw = torch.zeros((K_pad, N_pad), dtype=torch.float32, device=device)
+            uw = torch.zeros((K_pad, N_pad), dtype=torch.float32, device=device)
+
+            gw[:K, :N] = self.gate_proj.weight.t()
+            uw[:K, :N] = self.up_proj.weight.t()
+
+            self._gate_weight_t = gw
+            self._up_weight_t = uw
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_gating and MLP.FUSED and x.is_cuda:
             return self._forward_fused(x)
-        return self._forward_standard(x)
+            # Fallback to standard
+        return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
 
     def _forward_standard(self, x: torch.Tensor) -> torch.Tensor:
         """Standard (unfused) forward pass."""
@@ -912,13 +891,7 @@ class MLP:
 
     def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
         """Fused SwiGLU forward pass."""
-        if self.gate_proj.weight.device != x.device:
-            self.gate_proj.weight = self.gate_proj.weight.to(x.device)
-            self._gate_weight_t = None
-        if self.up_proj.weight.device != x.device:
-            self.up_proj.weight = self.up_proj.weight.to(x.device)
-            self._up_weight_t = None
-        self._prepare_fused_weights()
+        self._prepare_fused_weights(x.device)
 
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.hidden_size).to(torch.float32).contiguous()
@@ -926,65 +899,31 @@ class MLP:
         K = self.hidden_size
         N = self.intermediate_size
 
-        M_pad = pad_to_multiple(M, self.TILE_M)
-        K_pad = pad_to_multiple(K, self.TILE_K)
-        N_pad = pad_to_multiple(N, self.TILE_N)
-
-        if M != M_pad or K != K_pad:
-            x_padded = torch.zeros(
-                (M_pad, K_pad), dtype=torch.float32, device=x.device
-            )
-            x_padded[:M, :K] = x_2d
-        else:
-            x_padded = x_2d
-
-        if K != K_pad or N != N_pad:
-            gate_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
-            )
-            gate_w_padded[:K, :N] = self._gate_weight_t
-            up_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
-            )
-            up_w_padded[:K, :N] = self._up_weight_t
-        else:
-            gate_w_padded = self._gate_weight_t
-            up_w_padded = self._up_weight_t
-
-        intermediate = torch.zeros(
-            (M_pad, N_pad), dtype=torch.float32, device=x.device
-        )
+        # 直接输出到真实尺寸，不使用 intermediate_pad 拷贝
+        intermediate = torch.empty((M, N), dtype=torch.float32, device=x.device)
 
         grid = (
-            triton.cdiv(M_pad, self.TILE_M),
-            triton.cdiv(N_pad, self.TILE_N),
+            triton.cdiv(M, self.TILE_M),
+            triton.cdiv(N, self.TILE_N),
         )
         swiglu_fused_kernel[grid](
-            x_padded,
-            gate_w_padded,
-            up_w_padded,
+            x_2d,
+            self._gate_weight_t,
+            self._up_weight_t,
             intermediate,
-            M_pad,
-            N_pad,
-            K_pad,
-            x_padded.stride(0),
-            x_padded.stride(1),
-            gate_w_padded.stride(0),
-            gate_w_padded.stride(1),
-            up_w_padded.stride(0),
-            up_w_padded.stride(1),
-            intermediate.stride(0),
-            intermediate.stride(1),
+            M, N, self.hidden_size,  # 传入真实维度
+            x_2d.stride(0), x_2d.stride(1),
+            self._gate_weight_t.stride(0), self._gate_weight_t.stride(1),
+            self._up_weight_t.stride(0), self._up_weight_t.stride(1),
+            intermediate.stride(0), intermediate.stride(1),
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=8,  # 调优参数
+            num_stages=3
         )
 
-        if M != M_pad or N != N_pad:
-            intermediate = intermediate[:M, :N]
-
-        intermediate = intermediate.reshape(*orig_shape[:-1], self.intermediate_size)
-        return self.down_proj(intermediate)
+        return self.down_proj(intermediate.reshape(*orig_shape[:-1], N))
 
 
 class EncoderMLP:
