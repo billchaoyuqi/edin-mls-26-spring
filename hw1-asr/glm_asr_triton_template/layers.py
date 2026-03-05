@@ -674,7 +674,7 @@ class Linear:
         self._K_padded = None
         self._N_padded = None
 
-    def _ensure_weight_prepared(self):
+    def _ensure_weight_prepared(self, device):
         """Cache transposed and padded weight for Triton kernel."""
         if self._weight_t_padded is None or self._weight_t_padded.device != device:
             K = self.in_features
@@ -861,7 +861,7 @@ class MLP:
         self._gate_weight_t = None
         self._up_weight_t = None
 
-    def _prepare_fused_weights(self):
+    def _prepare_fused_weights(self, device):
         """Prepare pre-transposed weights for fused kernel."""
         if self._gate_weight_t is None or self._gate_weight_t.device != device:
             K, N = self.hidden_size, self.intermediate_size
