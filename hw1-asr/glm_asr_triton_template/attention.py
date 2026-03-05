@@ -220,7 +220,6 @@ def causal_mask_kernel(
 @triton.jit
 def flash_attn_fused_kernel(
         Q, K, V, Out,
-        L, M,  # 用于 Online Softmax 的中间变量 (可选，如果只在 Kernel 内计算可不存)
         sm_scale,
         stride_qb, stride_qh, stride_qm, stride_qk,
         stride_kb, stride_kh, stride_kn, stride_kk,
@@ -230,67 +229,57 @@ def flash_attn_fused_kernel(
         is_causal: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
-    # 获取当前 Batch 和 Head 的索引
-    bh_id = tl.program_id(0)
-    # 获取当前 Q 块的索引
-    m_id = tl.program_id(1)
+    pid_bh = tl.program_id(0)  # 范围: 0 ~ (Batch * Head - 1)
+    pid_m = tl.program_id(1)  # 范围: 0 ~ (Seq_Q / BLOCK_M)
 
-    # 偏移量
-    offs_m = m_id * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
 
-    # 计算 Q 的指针位移并加载 (BLOCK_M, BLOCK_D)
-    q_ptrs = Q + bh_id * stride_qb + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+    # 计算基础指针偏移 (针对 batch*head 的平铺)
+    # 注意：stride_qh 实际上代表了单组 head 在内存中的跨度
+    q_base = Q + pid_bh * stride_qh
+    k_base = K + pid_bh * stride_kh
+    v_base = V + pid_bh * stride_vh
+    o_base = Out + pid_bh * stride_oh
+
+    # 加载 Q
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
     q = tl.load(q_ptrs, mask=(offs_m[:, None] < Seq_Q) & (offs_d[None, :] < Head_Dim), other=0.0)
 
-    # 初始化 Online Softmax 统计量
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
-    # 遍历 K, V 的分块 (BLOCK_N 步长)
-    # FlashAttention 外层循环遍历 K, V 块，内层在 SRAM 处理
     for start_n in range(0, Seq_K, BLOCK_N):
-        # 加载 K (BLOCK_N, BLOCK_D)
-        k_ptrs = K + bh_id * stride_kb + (start_n + offs_n)[:, None] * stride_kn + offs_d[None, :] * stride_kk
+        k_ptrs = k_base + (start_n + offs_n)[:, None] * stride_kn + offs_d[None, :] * stride_kk
         k = tl.load(k_ptrs, mask=((start_n + offs_n)[:, None] < Seq_K) & (offs_d[None, :] < Head_Dim), other=0.0)
 
-        # 计算 qk^t: (BLOCK_M, BLOCK_N)
-        qk = tl.dot(q, tl.trans(k))
-        qk *= sm_scale
+        qk = tl.dot(q, tl.trans(k)) * sm_scale
 
-        # 应用 Causal Mask
         if is_causal:
-            qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0, -1e9)
+            qk = tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], qk, -1e9)
 
-        # --- Online Softmax 核心逻辑 ---
+        # 为了处理 Seq_K 不是 BLOCK_N 整数倍的情况，给无效列加负无穷
+        qk = tl.where((start_n + offs_n)[None, :] < Seq_K, qk, -float('inf'))
+
         m_ij = tl.max(qk, 1)
         m_next = tl.maximum(m_i, m_ij)
-
         p = tl.exp(qk - m_next[:, None])
-        l_ij = tl.sum(p, 1)
 
-        # 对旧累加值进行重缩放
+        l_ij = tl.sum(p, 1)
         alpha = tl.exp(m_i - m_next)
         acc = acc * alpha[:, None]
 
-        # 加载 V (BLOCK_N, BLOCK_D)
-        v_ptrs = V + bh_id * stride_vb + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vk
+        v_ptrs = v_base + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vk
         v = tl.load(v_ptrs, mask=((start_n + offs_n)[:, None] < Seq_K) & (offs_d[None, :] < Head_Dim), other=0.0)
 
-        # 累加输出: p @ v
         acc += tl.dot(p.to(v.dtype), v)
-
-        # 更新统计量
         l_i = l_i * alpha + l_ij
         m_i = m_next
 
-    # 最终归一化
     acc = acc / l_i[:, None]
-
-    # 写回输出
-    out_ptrs = Out + bh_id * stride_ob + offs_m[:, None] * stride_oh + offs_d[None, :] * stride_ok
+    out_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_ok
     tl.store(out_ptrs, acc, mask=(offs_m[:, None] < Seq_Q) & (offs_d[None, :] < Head_Dim))
 
 
