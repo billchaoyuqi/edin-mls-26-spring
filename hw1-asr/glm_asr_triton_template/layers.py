@@ -949,10 +949,18 @@ class EncoderMLP:
 
         self._fc1_weight_t = None
 
-    def _prepare_fused_weights(self):
-        """Prepare pre-transposed weights for fused kernel."""
-        if self._fc1_weight_t is None:
-            self._fc1_weight_t = self.fc1.weight.t().contiguous()
+    def _prepare_fused_weights(self, device):
+        """Prepare pre-padded and transposed weights for fused kernel."""
+        if self._fc1_weight_t is None or self._fc1_weight_t.device != device:
+            K = self.hidden_size
+            N = self.intermediate_size
+            K_pad = pad_to_multiple(K, self.TILE_K)
+            N_pad = pad_to_multiple(N, self.TILE_N)
+
+            # 提前做好填充并放入 GPU 缓存，彻底消除循环内开销
+            w_pad = torch.zeros((K_pad, N_pad), dtype=torch.float32, device=device)
+            w_pad[:K, :N] = self.fc1.weight.t()
+            self._fc1_weight_t = w_pad
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if EncoderMLP.FUSED and self.activation == "gelu" and x.is_cuda:
@@ -964,11 +972,8 @@ class EncoderMLP:
         return self.fc2(self.act_fn(self.fc1(x)))
 
     def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
-        """Fused Linear+GELU forward pass."""
-        if self.fc1.weight.device != x.device:
-            self.fc1.weight = self.fc1.weight.to(x.device)
-            self._fc1_weight_t = None
-        self._prepare_fused_weights()
+        """Fused Linear+GELU forward pass: Optimized Zero-copy."""
+        self._prepare_fused_weights(x.device)
 
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.hidden_size).to(torch.float32).contiguous()
@@ -976,62 +981,31 @@ class EncoderMLP:
         K = self.hidden_size
         N = self.intermediate_size
 
-        M_pad = pad_to_multiple(M, self.TILE_M)
-        K_pad = pad_to_multiple(K, self.TILE_K)
-        N_pad = pad_to_multiple(N, self.TILE_N)
-
-        if M != M_pad or K != K_pad:
-            x_padded = torch.zeros(
-                (M_pad, K_pad), dtype=torch.float32, device=x.device
-            )
-            x_padded[:M, :K] = x_2d
-        else:
-            x_padded = x_2d
-
-        if K != K_pad or N != N_pad:
-            fc1_w_padded = torch.zeros(
-                (K_pad, N_pad), dtype=torch.float32, device=x.device
-            )
-            fc1_w_padded[:K, :N] = self._fc1_weight_t
-        else:
-            fc1_w_padded = self._fc1_weight_t
-
-        intermediate = torch.zeros(
-            (M_pad, N_pad), dtype=torch.float32, device=x.device
-        )
+        # 核心修复：直接申请结果矩阵，去除 x_padded, fc1_w_padded 等所有中间冗余张量
+        intermediate = torch.empty((M, N), dtype=torch.float32, device=x.device)
 
         grid = (
-            triton.cdiv(M_pad, self.TILE_M),
-            triton.cdiv(N_pad, self.TILE_N),
+            triton.cdiv(M, self.TILE_M),
+            triton.cdiv(N, self.TILE_N),
         )
         linear_gelu_kernel[grid](
-            x_padded,
-            fc1_w_padded,
+            x_2d,
+            self._fc1_weight_t,
             intermediate,
-            M_pad,
-            N_pad,
-            K_pad,
-            x_padded.stride(0),
-            x_padded.stride(1),
-            fc1_w_padded.stride(0),
-            fc1_w_padded.stride(1),
-            intermediate.stride(0),
-            intermediate.stride(1),
+            M, N, K, # 传入真实的维度，依赖 Kernel 内的 mask 控制边界
+            x_2d.stride(0), x_2d.stride(1),
+            self._fc1_weight_t.stride(0), self._fc1_weight_t.stride(1),
+            intermediate.stride(0), intermediate.stride(1),
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            num_warps=8  # 增加并发度
         )
 
-        if M != M_pad or N != N_pad:
-            intermediate = intermediate[:M, :N]
-
         if self.bias_enabled and self.fc1.bias_param is not None:
-            if self.fc1.bias_param.device != x.device:
-                self.fc1.bias_param = self.fc1.bias_param.to(x.device)
-            intermediate = intermediate + self.fc1.bias_param
+            intermediate += self.fc1.bias_param.to(x.device)
 
-        intermediate = intermediate.reshape(*orig_shape[:-1], self.intermediate_size)
-        return self.fc2(intermediate)
+        return self.fc2(intermediate.reshape(*orig_shape[:-1], self.intermediate_size))
 
 
 if __name__ == "__main__":
