@@ -217,9 +217,87 @@ def causal_mask_kernel(
     )
 
 
+@triton.jit
+def flash_attn_fused_kernel(
+        Q, K, V, Out,
+        L, M,  # 用于 Online Softmax 的中间变量 (可选，如果只在 Kernel 内计算可不存)
+        sm_scale,
+        stride_qb, stride_qh, stride_qm, stride_qk,
+        stride_kb, stride_kh, stride_kn, stride_kk,
+        stride_vb, stride_vh, stride_vn, stride_vk,
+        stride_ob, stride_oh, stride_om, stride_ok,
+        Batch, Head, Seq_Q, Seq_K, Head_Dim,
+        is_causal: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    # 获取当前 Batch 和 Head 的索引
+    bh_id = tl.program_id(0)
+    # 获取当前 Q 块的索引
+    m_id = tl.program_id(1)
+
+    # 偏移量
+    offs_m = m_id * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    # 计算 Q 的指针位移并加载 (BLOCK_M, BLOCK_D)
+    q_ptrs = Q + bh_id * stride_qb + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qk
+    q = tl.load(q_ptrs, mask=(offs_m[:, None] < Seq_Q) & (offs_d[None, :] < Head_Dim), other=0.0)
+
+    # 初始化 Online Softmax 统计量
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float('inf')
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
+
+    # 遍历 K, V 的分块 (BLOCK_N 步长)
+    # FlashAttention 外层循环遍历 K, V 块，内层在 SRAM 处理
+    for start_n in range(0, Seq_K, BLOCK_N):
+        # 加载 K (BLOCK_N, BLOCK_D)
+        k_ptrs = K + bh_id * stride_kb + (start_n + offs_n)[:, None] * stride_kn + offs_d[None, :] * stride_kk
+        k = tl.load(k_ptrs, mask=((start_n + offs_n)[:, None] < Seq_K) & (offs_d[None, :] < Head_Dim), other=0.0)
+
+        # 计算 qk^t: (BLOCK_M, BLOCK_N)
+        qk = tl.dot(q, tl.trans(k))
+        qk *= sm_scale
+
+        # 应用 Causal Mask
+        if is_causal:
+            qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0, -1e9)
+
+        # --- Online Softmax 核心逻辑 ---
+        m_ij = tl.max(qk, 1)
+        m_next = tl.maximum(m_i, m_ij)
+
+        p = tl.exp(qk - m_next[:, None])
+        l_ij = tl.sum(p, 1)
+
+        # 对旧累加值进行重缩放
+        alpha = tl.exp(m_i - m_next)
+        acc = acc * alpha[:, None]
+
+        # 加载 V (BLOCK_N, BLOCK_D)
+        v_ptrs = V + bh_id * stride_vb + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vk
+        v = tl.load(v_ptrs, mask=((start_n + offs_n)[:, None] < Seq_K) & (offs_d[None, :] < Head_Dim), other=0.0)
+
+        # 累加输出: p @ v
+        acc += tl.dot(p.to(v.dtype), v)
+
+        # 更新统计量
+        l_i = l_i * alpha + l_ij
+        m_i = m_next
+
+    # 最终归一化
+    acc = acc / l_i[:, None]
+
+    # 写回输出
+    out_ptrs = Out + bh_id * stride_ob + offs_m[:, None] * stride_oh + offs_d[None, :] * stride_ok
+    tl.store(out_ptrs, acc, mask=(offs_m[:, None] < Seq_Q) & (offs_d[None, :] < Head_Dim))
+
+
 # ============================================================================
 # Attention Classes
 # ============================================================================
+
 
 class MultiHeadAttention:
     """Multi-head attention using Triton kernels."""
@@ -304,147 +382,58 @@ def scaled_dot_product_attention(
 
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
+        # 确保张量是连续的且为 float32
+        q = q.to(torch.float32).contiguous()
+        k = k.to(torch.float32).contiguous()
+        v = v.to(torch.float32).contiguous()
 
-    seq_k_padded = next_power_of_two(seq_k)
-    head_dim_padded = next_power_of_two(head_dim)
+        # 输出张量
+        output = torch.empty_like(q)
 
-    use_triton = (
-        q.is_cuda
-        and seq_k_padded <= MAX_ATTENTION_DIM
-        and head_dim_padded <= MAX_ATTENTION_DIM
-    )
-
-    if use_triton:
-        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32)
-        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
-        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
-
-        if seq_k_padded != seq_k or head_dim_padded != head_dim:
-            k_padded = torch.zeros(
-                (batch * num_heads, seq_k_padded, head_dim_padded),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            v_padded = torch.zeros_like(k_padded)
-            q_padded = torch.zeros(
-                (batch * num_heads, seq_q, head_dim_padded),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            k_padded[:, :seq_k, :head_dim] = k_flat
-            v_padded[:, :seq_k, :head_dim] = v_flat
-            q_padded[:, :, :head_dim] = q_flat
-            k_flat = k_padded
-            v_flat = v_padded
-            q_flat = q_padded
-
-        scores = torch.empty(
-            (batch * num_heads, seq_q, seq_k_padded),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        output = torch.empty(
-            (batch * num_heads, seq_q, head_dim_padded),
-            dtype=torch.float32,
-            device=q.device,
-        )
-
-        grid = (batch * num_heads, seq_q)
-        attention_scores_kernel[grid](
-            q_flat,
-            k_flat,
-            scores,
-            float(scale),
-            seq_k_padded,
-            head_dim_padded,
-            q_flat.stride(0),
-            q_flat.stride(1),
-            q_flat.stride(2),
-            k_flat.stride(0),
-            k_flat.stride(1),
-            k_flat.stride(2),
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
-            BLOCK_K=seq_k_padded,
-            BLOCK_D=head_dim_padded,
-        )
-
-        if seq_k_padded != seq_k:
-            scores[:, :, seq_k:] = -1e9
-
-        if is_causal:
-            mask = torch.triu(
-                torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
-                diagonal=1,
-            ) * -1e9
-            scores = scores + mask[None, :, :]
-
+        # 如果有 attention_mask 且不是简单的 Causal，可能需要回退到基础实现
+        # 但如果是 ASR 常见的对齐 Mask，你可以尝试将其融合进 Kernel
         if attention_mask is not None:
-            if attention_mask.ndim == 4:
-                attention_mask = attention_mask.reshape(
-                    batch * num_heads, seq_q, seq_k
-                )
-            if seq_k_padded != seq_k:
-                mask_padded = torch.zeros(
-                    (batch * num_heads, seq_q, seq_k_padded),
-                    dtype=torch.float32,
-                    device=q.device,
-                )
-                mask_padded[:, :, :seq_k] = attention_mask
-                mask_padded[:, :, seq_k:] = -1e9
-                attention_mask = mask_padded
-            scores = scores + attention_mask
+            # 暂时回退到通用实现或保持原逻辑
+            # 这里为了演示核心 FlashAttn，我们主要针对 Causal 和无 Mask 情况优化
+            use_triton = False
+        else:
+            use_triton = q.is_cuda
 
-        scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
-        block = seq_k_padded
-        softmax_inplace_kernel[(scores_2d.shape[0],)](
-            scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=block
-        )
-        scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
+        if use_triton:
+            # 根据 GPU 显存和 Head_Dim 自动调整分块
+            # 这是第三阶段“调优”优化的体现
+            BLOCK_M = 64 if head_dim <= 64 else 32
+            BLOCK_N = 64 if head_dim <= 64 else 32
 
-        attention_output_kernel[grid](
-            scores,
-            v_flat,
-            output,
-            seq_k_padded,
-            head_dim_padded,
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
-            v_flat.stride(0),
-            v_flat.stride(1),
-            v_flat.stride(2),
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            BLOCK_K=seq_k_padded,
-            BLOCK_D=head_dim_padded,
-        )
+            # Grid: (Batch * Heads, Q 分块数)
+            grid = (batch * num_heads, triton.cdiv(seq_q, BLOCK_M))
 
-        if head_dim_padded != head_dim:
-            output = output[:, :, :head_dim]
+            flash_attn_fused_kernel[grid](
+                q, k, v, output,
+                None, None,  # L, M 统计量这里直接在 Kernel 内部处理
+                float(scale),
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+                batch, num_heads, seq_q, seq_k, head_dim,
+                is_causal=is_causal,
+                BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=triton.next_power_of_2(head_dim),
+                num_warps=8,
+                num_stages=2
+            )
+            return output
 
-        return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
+        # --- Fallback 逻辑 (PyTorch 原生) ---
+        scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
+        if is_causal:
+            mask = torch.triu(torch.ones((seq_q, seq_k), device=q.device), diagonal=1) * -1e9
+            scores += mask
+        if attention_mask is not None:
+            scores += attention_mask
 
-    scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
-
-    if is_causal:
-        mask = torch.triu(
-            torch.ones((seq_q, seq_k), dtype=torch.float32, device=q.device),
-            diagonal=1,
-        ) * -1e9
-        scores = scores + mask[None, None, :, :]
-
-    if attention_mask is not None:
-        scores = scores + attention_mask
-
-    scores = scores - torch.max(scores, dim=-1, keepdim=True).values
-    attn_weights = torch.exp(scores)
-    attn_weights = attn_weights / torch.sum(attn_weights, dim=-1, keepdim=True)
-    output = torch.einsum("bnqk,bnkd->bnqd", attn_weights, v)
-
-    return output.to(q.dtype)
+        attn_weights = torch.softmax(scores, dim=-1)
+        return torch.einsum("bnqk,bnkd->bnqd", attn_weights, v).to(q.dtype)
 
 
 if __name__ == "__main__":
