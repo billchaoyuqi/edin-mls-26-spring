@@ -20,7 +20,6 @@ import importlib
 # Expected transcription for the test audio
 EXPECTED_TEXT = "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS"
 
-
 def download_librispeech_sample():
     """Download a LibriSpeech sample audio file."""
     import urllib.request
@@ -35,9 +34,11 @@ def download_librispeech_sample():
         return audio_path
 
     print("Downloading LibriSpeech sample...")
+    # Use a direct FLAC file from OpenSLR
     url = "https://www.openslr.org/resources/12/test-clean/61/70968/61-70968-0000.flac"
 
     try:
+        # Try downloading from a simpler source
         urllib.request.urlretrieve(url, audio_path)
         return audio_path
     except:
@@ -75,12 +76,14 @@ def load_test_audio(audio_path=None):
 
             return audio, sr
 
+    # If audio_path specified, use it directly
     if audio_path and os.path.exists(audio_path):
         audio_paths = [audio_path]
     else:
+        # Try to load from common locations - prioritize local test_audio.wav
         script_dir = os.path.dirname(os.path.abspath(__file__))
         audio_paths = [
-            os.path.join(script_dir, "test_audio.wav"),
+            os.path.join(script_dir, "test_audio.wav"),  # Local test audio first
             "/tmp/test_audio.wav",
             os.path.expanduser("~/.cache/glm_asr/test_audio.wav"),
             os.path.expanduser("~/.cache/glm_asr/test_audio.flac"),
@@ -100,12 +103,14 @@ def load_test_audio(audio_path=None):
                 continue
 
     if audio_array is None:
+        # Use synthetic test audio
         print("Using synthetic test audio (for structure validation only)")
         duration = 5.0
         t = np.linspace(0, duration, int(sr * duration), dtype=np.float32)
         audio_array = 0.5 * np.sin(2 * np.pi * 440 * t)
         return audio_array.astype(np.float32), "[synthetic]", duration
 
+    # Resample to 16kHz if needed
     target_sr = 16000
     if sr != target_sr:
         try:
@@ -113,6 +118,7 @@ def load_test_audio(audio_path=None):
             num_samples = int(len(audio_array) * target_sr / sr)
             audio_array = signal.resample(audio_array, num_samples)
         except ImportError:
+            # Simple linear interpolation
             old_indices = np.arange(len(audio_array))
             new_length = int(len(audio_array) * target_sr / sr)
             new_indices = np.linspace(0, len(audio_array) - 1, new_length)
@@ -123,6 +129,7 @@ def load_test_audio(audio_path=None):
 
 
 def benchmark_cutile_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
+    """Benchmark a CuTile implementation folder."""
     import cupy as cp
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -131,17 +138,21 @@ def benchmark_cutile_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
     if not os.path.isdir(folder_path):
         raise FileNotFoundError(f"Folder not found: {folder_path}")
 
+    # Check required files
     required_files = ['__init__.py', 'model.py', 'layers.py', 'weight_loader.py']
     missing = [f for f in required_files if not os.path.exists(os.path.join(folder_path, f))]
     if missing:
         raise FileNotFoundError(f"Missing required files: {', '.join(missing)}")
 
+    # Add folder to path
     sys.path.insert(0, folder_path)
 
+    # Clear cached modules
     for mod_name in list(sys.modules.keys()):
         if mod_name in ['weight_loader', 'model', 'layers', 'attention', 'rope', 'conv', 'decode_attention']:
             del sys.modules[mod_name]
 
+    # Apply version-specific configurations
     if 'example' in folder_name.lower():
         print("Applying baseline configuration (example)...")
         layers = importlib.import_module("layers")
@@ -149,14 +160,15 @@ def benchmark_cutile_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
         layers.MLP.FUSED = False
         if hasattr(layers, 'AudioMLP'):
             layers.AudioMLP.FUSED = False
-
     print(f"Loading model from {folder_name}...")
     from weight_loader import load_model_from_hf
 
     model, processor = load_model_from_hf("zai-org/GLM-ASR-Nano-2512")
 
+    # Prepare inputs
     input_features, input_ids, input_features_mask = prepare_inputs(audio_array, processor)
 
+    # Determine generate function
     generate_fn = model.generate
     if hasattr(model, 'generate_v8b'):
         generate_fn = model.generate_v8b
@@ -167,6 +179,7 @@ def benchmark_cutile_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
 
     print(f"Using generate function: {generate_fn.__name__}")
 
+    # Warmup
     print(f"Warmup ({num_warmup} runs)...")
     for _ in range(num_warmup):
         try:
@@ -175,12 +188,14 @@ def benchmark_cutile_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
                 max_new_tokens=100, temperature=1.0, top_k=1
             )
         except TypeError:
+            # Try without some arguments
             _ = generate_fn(
                 input_features, input_ids=input_ids,
                 max_new_tokens=100, temperature=1.0, top_k=1
             )
         cp.cuda.Device().synchronize()
 
+    # Benchmark
     print(f"Benchmarking ({num_runs} runs)...")
     times = []
     for i in range(num_runs):
@@ -200,11 +215,13 @@ def benchmark_cutile_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
         elapsed = (time.perf_counter() - start) * 1000
         times.append(elapsed)
         tokens = output.shape[1] - input_ids.shape[1]
-        print(f"  Run {i + 1}: {elapsed:.1f}ms ({tokens} tokens)")
+        print(f"  Run {i+1}: {elapsed:.1f}ms ({tokens} tokens)")
 
+    # Decode output
     generated_np = cp.asnumpy(output)
     transcription = decode_output(generated_np, processor)
 
+    # Clean up
     sys.path.remove(folder_path)
 
     return {
@@ -281,12 +298,9 @@ def benchmark_triton_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
 
     print(f"Benchmarking ({num_runs} runs)...")
     times = []
-
-    # 彻底移除了这里的 reset_peak_memory_stats 和 peak_memory_allocated 逻辑
     for i in range(num_runs):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-
         start = time.perf_counter()
         with torch.no_grad():
             try:
@@ -299,14 +313,12 @@ def benchmark_triton_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
                     input_features, input_ids=input_ids,
                     max_new_tokens=100, temperature=1.0, top_k=1
                 )
-
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-
         elapsed = (time.perf_counter() - start) * 1000
         times.append(elapsed)
         tokens = output.shape[1] - input_ids.shape[1]
-        print(f"  Run {i + 1}: {elapsed:.1f}ms ({tokens} tokens)")
+        print(f"  Run {i+1}: {elapsed:.1f}ms ({tokens} tokens)")
 
     generated_np = output.detach().cpu().numpy()
     transcription = decode_output(generated_np, processor)
@@ -338,6 +350,7 @@ def benchmark_scratch_folder(folder_name, audio_array, num_warmup=1, num_runs=3)
 
     model, processor = load_model_and_processor(dtype='float32')
 
+    # Prepare inputs
     inputs = processor.apply_transcription_request(audio_array)
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
@@ -347,6 +360,7 @@ def benchmark_scratch_folder(folder_name, audio_array, num_warmup=1, num_runs=3)
     attention_mask = inputs['attention_mask'].to(device)
     input_len = input_ids.shape[1]
 
+    # Warmup
     print(f"Warmup ({num_warmup} runs)...")
     for _ in range(num_warmup):
         with torch.no_grad():
@@ -359,6 +373,7 @@ def benchmark_scratch_folder(folder_name, audio_array, num_warmup=1, num_runs=3)
             )
         torch.cuda.synchronize()
 
+    # Benchmark
     print(f"Benchmarking ({num_runs} runs)...")
     times = []
     for i in range(num_runs):
@@ -376,8 +391,9 @@ def benchmark_scratch_folder(folder_name, audio_array, num_warmup=1, num_runs=3)
         elapsed = (time.perf_counter() - start) * 1000
         times.append(elapsed)
         tokens = output.shape[1] - input_len
-        print(f"  Run {i + 1}: {elapsed:.1f}ms ({tokens} tokens)")
+        print(f"  Run {i+1}: {elapsed:.1f}ms ({tokens} tokens)")
 
+    # Decode output
     generated_ids = output[:, input_len:]
     transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)
     if isinstance(transcription, list):
@@ -406,12 +422,14 @@ def prepare_inputs(audio_array, processor):
         if hasattr(inputs, 'input_features_mask') and inputs.input_features_mask is not None:
             input_features_mask = cp.asarray(inputs.input_features_mask.numpy(), dtype=cp.float32)
     else:
+        # Manual processing
         features = processor(audio_array, sampling_rate=16000, return_tensors="pt", padding="max_length")
         input_features = cp.asarray(features['input_features'].numpy(), dtype=cp.float32)
 
         mel_frames = input_features.shape[-1]
         num_audio_tokens = max(1, mel_frames // 2 // 4)
 
+        # Build input_ids
         user_token_id = 59253
         assistant_token_id = 59254
         begin_audio_token_id = 59261
@@ -490,13 +508,16 @@ def decode_output(generated_np, processor):
 
 def check_transcription(transcription, expected):
     """Check if transcription matches expected text."""
+    # Normalize both strings
     trans_norm = transcription.upper().strip()
     exp_norm = expected.upper().strip()
 
+    # Remove punctuation
     import re
     trans_norm = re.sub(r'[^\w\s]', '', trans_norm)
     exp_norm = re.sub(r'[^\w\s]', '', exp_norm)
 
+    # Check similarity
     trans_words = set(trans_norm.split())
     exp_words = set(exp_norm.split())
 
@@ -521,11 +542,13 @@ def main():
     print("GLM-ASR Student Version Benchmark")
     print("=" * 70)
 
+    # Load test audio
     print("\nLoading test audio...")
     audio_array, expected, duration = load_test_audio(args.audio)
     print(f"Audio duration: {duration:.2f}s")
     print(f"Expected: {expected}")
 
+    # Determine implementation type
     folder = args.folder
     is_scratch = 'scratch' in folder.lower()
     is_triton = 'triton' in folder.lower()
@@ -542,17 +565,19 @@ def main():
         else:
             results = benchmark_cutile_folder(folder, audio_array, args.warmup, args.runs)
 
+        # Print results
         print("\n" + "=" * 70)
         print("RESULTS")
         print("=" * 70)
         print(f"Time: {results['mean']:.1f}ms (+/- {results['std']:.1f}ms)")
         print(f"Tokens: {results['tokens']}")
-        print(f"Speed: {results['mean'] / results['tokens']:.2f}ms/token")
+        print(f"Speed: {results['mean']/results['tokens']:.2f}ms/token")
         print(f"\nTranscription: {results['transcription']}")
 
+        # Check correctness
         if expected != "[synthetic]":
             passed, accuracy = check_transcription(results['transcription'], expected)
-            print(f"\nAccuracy: {accuracy * 100:.1f}%")
+            print(f"\nAccuracy: {accuracy*100:.1f}%")
             if passed:
                 print("Status: PASS")
             else:
