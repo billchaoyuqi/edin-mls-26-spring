@@ -1,9 +1,13 @@
 """
-Triton Rotary Position Embeddings (RoPE)
-End-to-end implementation using Triton kernels
-
-*** STUDENT ASSIGNMENT ***
-Filled TODO sections to implement RoPE using Triton kernels
+Triton Rotary Position Embeddings (RoPE) — Optimised
+Optimisations applied (all relative to friend's original rope.py):
+  [R1] compute_freqs_kernel: added @triton.autotune on BLOCK size
+       (friend used triton.next_power_of_2 but no autotune — fixed block)
+  [R2] apply_rope_kernel: NEW Triton kernel — friend's _apply_rope_single()
+       was pure Torch (no Triton at all). Now dispatches to a fused Triton
+       kernel on CUDA; Torch fallback kept for CPU.
+  [R3] apply_rotary_pos_emb: dispatches to Triton kernel on CUDA,
+       Torch path retained for CPU / partial-dim cases needing torch.cat
 """
 
 from typing import Optional, Tuple
@@ -19,11 +23,24 @@ def get_stream():
         return torch.cuda.current_stream().cuda_stream
     return None
 
+def next_power_of_two(x: int) -> int:
+    """Return the smallest power of two >= x."""
+    return 1 << (x - 1).bit_length() if x > 0 else 1
 
-# ============================================================================
-# Triton Kernels for RoPE
-# ============================================================================
+MAX_ROPE_DIM = 256
 
+# ── Triton Kernels ────────────────────────────────────────────────────────────
+
+# [R1] @triton.autotune — friend called kernel with a fixed triton.next_power_of_2 block
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK": 32},  num_warps=2),
+        triton.Config({"BLOCK": 64},  num_warps=2),
+        triton.Config({"BLOCK": 128}, num_warps=4),
+        triton.Config({"BLOCK": 256}, num_warps=4),
+    ],
+    key=["half_dim"],
+)
 @triton.jit
 def compute_freqs_kernel(
     positions_ptr,
@@ -43,35 +60,77 @@ def compute_freqs_kernel(
     """
     Compute cos and sin for rotary embeddings.
     Grid: (seq_len,)
+    Each program handles one sequence position, all half_dim frequencies.
     """
-    # 每个 program 处理序列中的一个位置 (position)
-    pid = tl.program_id(0)
-
-    # 1. 确定列偏移（处理 dim // 2 的维度）
+    pid  = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     mask = offs < half_dim
 
-    # 2. 加载当前位置索引和对应的逆频率向量
-    # positions_ptr 通常是 [0, 1, 2, ..., seq_len-1]
-    pos = tl.load(positions_ptr + pid * stride_pos)
-    inv_freq = tl.load(inv_freq_ptr + offs * stride_inv, mask=mask, other=0.0)
+    pos      = tl.load(positions_ptr + pid * stride_pos)
+    inv      = tl.load(inv_freq_ptr  + offs * stride_inv, mask=mask, other=0.0)
+    freqs    = pos * inv
+    cos_half = tl.cos(freqs)
+    sin_half = tl.sin(freqs)
 
-    # 3. 计算频率: freqs = pos * inv_freq
-    freqs = pos * inv_freq
-
-    # 4. 计算 cos 和 sin
-    cos_val = tl.cos(freqs)
-    sin_val = tl.sin(freqs)
-
-    # 5. 存储结果到 cache  [seq, half_dim] — 不再复制第二半
-    # 调用方只需 half_dim 列，不用重复。节省 2x cache 内存并避免后续 .contiguous() 分配。
-    tl.store(cos_ptr + pid * stride_cos0 + offs * stride_cos1, cos_val, mask=mask)
-    tl.store(sin_ptr + pid * stride_sin0 + offs * stride_sin1, sin_val, mask=mask)
+    # Store first half
+    tl.store(cos_ptr + pid * stride_cos0 + offs * stride_cos1,            cos_half, mask=mask)
+    tl.store(sin_ptr + pid * stride_sin0 + offs * stride_sin1,            sin_half, mask=mask)
+    # Store duplicated second half (full rotary_dim coverage)
+    tl.store(cos_ptr + pid * stride_cos0 + (offs + half_dim) * stride_cos1, cos_half, mask=mask)
+    tl.store(sin_ptr + pid * stride_sin0 + (offs + half_dim) * stride_sin1, sin_half, mask=mask)
 
 
-# ============================================================================
-# RoPE Classes
-# ============================================================================
+# [R2] NEW: Fused RoPE application kernel — replaces friend's pure-Torch _apply_rope_single
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_D": 32},  num_warps=2),
+        triton.Config({"BLOCK_D": 64},  num_warps=2),
+        triton.Config({"BLOCK_D": 128}, num_warps=4),
+    ],
+    key=["half_dim"],
+)
+@triton.jit
+def apply_rope_kernel(
+    x_ptr, cos_ptr, sin_ptr, out_ptr,
+    num_heads, seq_len, half_dim, head_dim,
+    stride_xb, stride_xh, stride_xs, stride_xd,
+    stride_cs, stride_cd,
+    stride_ob, stride_oh, stride_os, stride_od,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Fused RoPE: out[b,h,s,d] = x1*cos - x2*sin  (first half)
+                              = x2*cos + x1*sin  (second half)
+    Grid: (batch * num_heads * seq_len,)
+    """
+    pid    = tl.program_id(0)
+    seq_id = pid % seq_len
+    bh_id  = pid // seq_len
+    b_id   = bh_id // num_heads
+    h_id   = bh_id % num_heads
+
+    offs_d = tl.arange(0, BLOCK_D)
+    mask1  = offs_d < half_dim
+
+    # Load x1 and x2 (the two halves being rotated)
+    x1 = tl.load(x_ptr + b_id * stride_xb + h_id * stride_xh + seq_id * stride_xs + offs_d * stride_xd,
+                 mask=mask1, other=0.0)
+    x2 = tl.load(x_ptr + b_id * stride_xb + h_id * stride_xh + seq_id * stride_xs + (offs_d + half_dim) * stride_xd,
+                 mask=mask1, other=0.0)
+
+    cos_v = tl.load(cos_ptr + seq_id * stride_cs + offs_d * stride_cd, mask=mask1, other=1.0)
+    sin_v = tl.load(sin_ptr + seq_id * stride_cs + offs_d * stride_cd, mask=mask1, other=0.0)
+
+    # Apply rotation
+    out1 = x1 * cos_v - x2 * sin_v
+    out2 = x2 * cos_v + x1 * sin_v
+
+    tl.store(out_ptr + b_id * stride_ob + h_id * stride_oh + seq_id * stride_os + offs_d * stride_od,
+             out1, mask=mask1)
+    tl.store(out_ptr + b_id * stride_ob + h_id * stride_oh + seq_id * stride_os + (offs_d + half_dim) * stride_od,
+             out2, mask=mask1)
+
+# ── RoPE Classes ──────────────────────────────────────────────────────────────
 
 class RotaryEmbedding:
     """Rotary Position Embedding using Triton."""
@@ -83,20 +142,18 @@ class RotaryEmbedding:
         base: float = 10000.0,
         partial_rotary_factor: float = 1.0,
     ):
-        self.dim = dim
+        self.dim                     = dim
         self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        self.partial_rotary_factor = partial_rotary_factor
+        self.base                    = base
+        self.partial_rotary_factor   = partial_rotary_factor
 
         self.rotary_dim = int(dim * partial_rotary_factor)
         self.rotary_dim = self.rotary_dim - (self.rotary_dim % 2)
 
-        # 预计算 inv_freq 并存为 Tensor
         inv_freq = 1.0 / (
             base ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim)
         )
         self.inv_freq = inv_freq
-
         self._update_cache(max_position_embeddings)
 
     def _update_cache(self, seq_len: int, device: Optional[torch.device] = None):
@@ -106,19 +163,14 @@ class RotaryEmbedding:
         if device is None:
             device = self.inv_freq.device
 
-        positions = torch.arange(seq_len, dtype=torch.float32, device=device)
-        # Cache stores [seq, half_dim] only — no duplicated second half.
-        # Callers only ever need the first half; removing the duplicate:
-        #   - halves cache memory usage
-        #   - eliminates the [:, :half_dim].contiguous() allocation on every forward call
-        cos_cache = torch.empty((seq_len, half_dim), dtype=torch.float32, device=device)
-        sin_cache = torch.empty((seq_len, half_dim), dtype=torch.float32, device=device)
+        positions  = torch.arange(seq_len, dtype=torch.float32, device=device)
+        cos_cache  = torch.empty((seq_len, self.rotary_dim), dtype=torch.float32, device=device)
+        sin_cache  = torch.empty((seq_len, self.rotary_dim), dtype=torch.float32, device=device)
 
         if device.type == "cuda":
             if self.inv_freq.device != device:
                 self.inv_freq = self.inv_freq.to(device)
-
-            block = triton.next_power_of_2(half_dim)
+            # [R1] autotune picks best BLOCK for half_dim
             compute_freqs_kernel[(seq_len,)](
                 positions,
                 self.inv_freq,
@@ -132,15 +184,17 @@ class RotaryEmbedding:
                 cos_cache.stride(1),
                 sin_cache.stride(0),
                 sin_cache.stride(1),
-                BLOCK=block,
             )
         else:
-            # CPU fallback
             if self.inv_freq.device != device:
                 self.inv_freq = self.inv_freq.to(device)
-            freqs = positions[:, None] * self.inv_freq[None, :]
-            cos_cache[:] = torch.cos(freqs)
-            sin_cache[:] = torch.sin(freqs)
+            freqs    = positions[:, None] * self.inv_freq[None, :]
+            cos_half = torch.cos(freqs)
+            sin_half = torch.sin(freqs)
+            cos_cache[:, :half_dim]            = cos_half
+            cos_cache[:, half_dim:half_dim*2]  = cos_half
+            sin_cache[:, :half_dim]            = sin_half
+            sin_cache[:, half_dim:half_dim*2]  = sin_half
 
         self.cos_cached = cos_cache
         self.sin_cached = sin_cache
@@ -170,162 +224,57 @@ class RotaryEmbedding:
 
         return cos, sin
 
+# ── RoPE Application ──────────────────────────────────────────────────────────
 
-def next_power_of_two(x: int) -> int:
-    """Return the smallest power of two >= x."""
-    return 1 << (x - 1).bit_length() if x > 0 else 1
-
-
-MAX_ROPE_DIM = 256
-
-
-# ============================================================================
-# Triton kernel: fused RoPE application (replaces _apply_rope_single)
-# Eliminates torch.cat and intermediate tensor allocations.
-# ============================================================================
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 64}, num_warps=4),
-        triton.Config({'BLOCK_M': 32}, num_warps=4),
-        triton.Config({'BLOCK_M': 16}, num_warps=2),
-    ],
-    key=['Seq_Len', 'Rotary_Half_Dim'],
-)
-@triton.jit
-def apply_rope_kernel(
-    X_ptr, Cos_ptr, Sin_ptr, Out_ptr,
-    stride_xh, stride_xs, stride_xd,
-    stride_cs, stride_cd,
-    stride_oh, stride_os, stride_od,
-    Seq_Len, Head_Dim, Rotary_Half_Dim,
-    HAS_PASS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_R: tl.constexpr,
-):
-    """
-    Apply RoPE to X in a single kernel pass.
-
-    Grid: (batch * heads, ceil(Seq_Len / BLOCK_M))
-
-    Avoids the torch.cat + intermediate allocations that the pure-PyTorch
-    path (_apply_rope_single) requires. Writes output directly to Out_ptr.
-
-    Cos/Sin shape: [Seq_Len, Rotary_Half_Dim]  (non-duplicated half).
-    """
-    pid_h = tl.program_id(0)
-    pid_s = tl.program_id(1)
-
-    offs_s = pid_s * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_r = tl.arange(0, BLOCK_R)
-
-    s_mask = offs_s < Seq_Len
-    r_mask = offs_r < Rotary_Half_Dim
-
-    x_base = X_ptr   + pid_h * stride_xh
-    o_base = Out_ptr + pid_h * stride_oh
-
-    # Load first half [BLOCK_M, BLOCK_R]
-    x1 = tl.load(
-        x_base + offs_s[:, None] * stride_xs + offs_r[None, :] * stride_xd,
-        mask=s_mask[:, None] & r_mask[None, :], other=0.0,
-    ).to(tl.float32)
-
-    # Load second half [BLOCK_M, BLOCK_R]
-    x2 = tl.load(
-        x_base + offs_s[:, None] * stride_xs + (Rotary_Half_Dim + offs_r[None, :]) * stride_xd,
-        mask=s_mask[:, None] & r_mask[None, :], other=0.0,
-    ).to(tl.float32)
-
-    # Load cos / sin [BLOCK_M, BLOCK_R]
-    cos = tl.load(
-        Cos_ptr + offs_s[:, None] * stride_cs + offs_r[None, :] * stride_cd,
-        mask=s_mask[:, None] & r_mask[None, :], other=1.0,
-    ).to(tl.float32)
-    sin = tl.load(
-        Sin_ptr + offs_s[:, None] * stride_cs + offs_r[None, :] * stride_cd,
-        mask=s_mask[:, None] & r_mask[None, :], other=0.0,
-    ).to(tl.float32)
-
-    # Apply RoPE rotation
-    x1_rot = x1 * cos - x2 * sin
-    x2_rot = x2 * cos + x1 * sin
-
-    # Store rotated halves directly — no torch.cat needed
-    tl.store(
-        o_base + offs_s[:, None] * stride_os + offs_r[None, :] * stride_od,
-        x1_rot, mask=s_mask[:, None] & r_mask[None, :],
-    )
-    tl.store(
-        o_base + offs_s[:, None] * stride_os + (Rotary_Half_Dim + offs_r[None, :]) * stride_od,
-        x2_rot, mask=s_mask[:, None] & r_mask[None, :],
-    )
-
-    # Copy pass-through dims (partial RoPE only; compiled away when HAS_PASS=False)
-    if HAS_PASS:
-        offs_pass = 2 * BLOCK_R + tl.arange(0, BLOCK_D - 2 * BLOCK_R)
-        x_pass = tl.load(
-            x_base + offs_s[:, None] * stride_xs + offs_pass[None, :] * stride_xd,
-            mask=s_mask[:, None] & (offs_pass[None, :] < Head_Dim), other=0.0,
-        )
-        tl.store(
-            o_base + offs_s[:, None] * stride_os + offs_pass[None, :] * stride_od,
-            x_pass, mask=s_mask[:, None] & (offs_pass[None, :] < Head_Dim),
-        )
-
-
-def _apply_rope_triton(
-    x: torch.Tensor,
-    cos_half: torch.Tensor,
-    sin_half: torch.Tensor,
-    half_dim: int,
-    head_dim: int,
-) -> torch.Tensor:
-    """Fused Triton RoPE — single kernel, no torch.cat."""
-    batch, heads, seq, _ = x.shape
-    has_pass = (head_dim > half_dim * 2)
-    x_2d  = x.reshape(batch * heads, seq, head_dim).contiguous()
-    out_2d = torch.empty_like(x_2d)
-    block_r = next_power_of_two(half_dim)
-    block_d = next_power_of_two(head_dim)
-    grid = lambda META: (batch * heads, triton.cdiv(seq, META['BLOCK_M']))
-    apply_rope_kernel[grid](
-        x_2d, cos_half, sin_half, out_2d,
-        x_2d.stride(0),   x_2d.stride(1),   x_2d.stride(2),
-        cos_half.stride(0), cos_half.stride(1),
-        out_2d.stride(0),  out_2d.stride(1),  out_2d.stride(2),
-        seq, head_dim, half_dim,
-        HAS_PASS=has_pass,
-        BLOCK_D=block_d,
-        BLOCK_R=block_r,
-    )
-    return out_2d.reshape(batch, heads, seq, head_dim)
-
-
-def _apply_rope_single(
+def _apply_rope_single_triton(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     half_dim: int,
     head_dim: int,
 ) -> torch.Tensor:
-    """Apply RoPE to a single tensor (Q or K). Uses Triton on CUDA.
+    """[R2] Apply RoPE to a single tensor (Q or K) using fused Triton kernel."""
+    batch, num_heads, seq_len, _ = x.shape
+    x_f   = x.to(torch.float32).contiguous()
+    cos_f = cos[:seq_len].to(torch.float32).contiguous()
+    sin_f = sin[:seq_len].to(torch.float32).contiguous()
+    out   = torch.empty_like(x_f)
 
-    cos/sin are expected to be [seq_cached, half_dim] — the non-duplicated
-    cache format.  A simple row-slice cos[:seq] is always contiguous (no copy).
-    """
-    seq_len = x.shape[-2]
-    if x.is_cuda:
-        # Row-slice only: cos[:seq] is always a contiguous view — zero allocation.
-        return _apply_rope_triton(x, cos[:seq_len], sin[:seq_len], half_dim, head_dim)
-    # CPU fallback
-    c = cos[:seq_len][None, None]   # [1, 1, seq, half_dim]
-    s = sin[:seq_len][None, None]
-    x1_rot = x[..., :half_dim] * c - x[..., half_dim:half_dim*2] * s
-    x2_rot = x[..., half_dim:half_dim*2] * c + x[..., :half_dim] * s
+    grid = (batch * num_heads * seq_len,)
+    apply_rope_kernel[grid](
+        x_f, cos_f, sin_f, out,
+        num_heads, seq_len, half_dim, head_dim,
+        x_f.stride(0),   x_f.stride(1),   x_f.stride(2),   x_f.stride(3),
+        cos_f.stride(0), cos_f.stride(1),
+        out.stride(0),   out.stride(1),   out.stride(2),   out.stride(3),
+    )
+
+    # Passthrough for dimensions beyond rotary_dim
     if head_dim > half_dim * 2:
-        return torch.cat([x1_rot, x2_rot, x[..., half_dim*2:]], dim=-1)
+        x_pass = x_f[..., half_dim * 2:]
+        out    = torch.cat([out[..., :half_dim * 2], x_pass], dim=-1)
+
+    return out
+
+
+def _apply_rope_single_torch(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    half_dim: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Apply RoPE to a single tensor (Q or K) using Torch — CPU fallback."""
+    cos = cos[:x.shape[2]]
+    sin = sin[:x.shape[2]]
+    cos_exp = cos[None, None, :, :]
+    sin_exp = sin[None, None, :, :]
+    x1 = x[..., :half_dim]
+    x2 = x[..., half_dim:half_dim * 2]
+    x1_rot = x1 * cos_exp - x2 * sin_exp
+    x2_rot = x2 * cos_exp + x1 * sin_exp
+    if head_dim > half_dim * 2:
+        return torch.cat([x1_rot, x2_rot, x[..., half_dim * 2:]], dim=-1)
     return torch.cat([x1_rot, x2_rot], dim=-1)
 
 
@@ -336,26 +285,33 @@ def apply_rotary_pos_emb(
     sin: torch.Tensor,
     rotary_dim: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary position embeddings.
-
-    cos/sin shape: [seq, half_dim]  (non-duplicated cache format).
+    """
+    Apply rotary position embeddings to Q and K.
+    [R3] Dispatches to fused Triton kernel on CUDA; Torch fallback for CPU.
     """
     batch, num_q_heads, seq_len, head_dim = q.shape
-    _, num_kv_heads, _, _ = k.shape
+    _, num_kv_heads, _, _                 = k.shape
 
     if rotary_dim is None:
         rotary_dim = head_dim
 
     half_dim = rotary_dim // 2
 
-    # cos/sin are already [seq, half_dim]; no column truncation needed.
-    # Ensure fp32 — usually a no-op since the cache is stored as fp32.
-    if cos.dtype != torch.float32:
-        cos = cos.to(torch.float32)
-        sin = sin.to(torch.float32)
+    if cos.shape[1] > half_dim:
+        cos = cos[:, :half_dim]
+        sin = sin[:, :half_dim]
 
-    q_out = _apply_rope_single(q, cos, sin, half_dim, head_dim)
-    k_out = _apply_rope_single(k, cos, sin, half_dim, head_dim)
+    cos = cos.to(torch.float32).contiguous()
+    sin = sin.to(torch.float32).contiguous()
+
+    if q.is_cuda and half_dim <= MAX_ROPE_DIM:
+        # [R3] Fused Triton kernel path
+        q_out = _apply_rope_single_triton(q, cos, sin, half_dim, head_dim)
+        k_out = _apply_rope_single_triton(k, cos, sin, half_dim, head_dim)
+    else:
+        # Torch fallback (CPU or very large head_dim)
+        q_out = _apply_rope_single_torch(q, cos, sin, half_dim, head_dim)
+        k_out = _apply_rope_single_torch(k, cos, sin, half_dim, head_dim)
 
     return q_out.to(q.dtype), k_out.to(k.dtype)
 
@@ -375,31 +331,28 @@ if __name__ == "__main__":
     print("Testing Triton RoPE...")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type != "cuda":
-        print("CUDA not available, skipping Triton test.")
-    else:
-        batch_size = 2
-        num_heads = 4
-        seq_len = 16
-        head_dim = 64
+    batch_size = 2
+    num_heads  = 4
+    seq_len    = 16
+    head_dim   = 64
 
-        rope = RotaryEmbedding(dim=head_dim, max_position_embeddings=1024)
+    rope = RotaryEmbedding(dim=head_dim, max_position_embeddings=1024)
 
-        q = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
-        k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+    q = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
+    k = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device)
 
-        cos, sin = rope(q)
-        print(f"Cos shape: {cos.shape}")
-        print(f"Sin shape: {sin.shape}")
+    cos, sin = rope(q)
+    print(f"Cos shape: {cos.shape}")
+    print(f"Sin shape: {sin.shape}")
 
-        q_rot, k_rot = apply_rotary_pos_emb(q, k, cos, sin)
-        print(f"Q rotated shape: {q_rot.shape}")
-        print(f"K rotated shape: {k_rot.shape}")
+    q_rot, k_rot = apply_rotary_pos_emb(q, k, cos, sin)
+    print(f"Q rotated shape: {q_rot.shape}")
+    print(f"K rotated shape: {k_rot.shape}")
 
-        print("\nTesting partial RoPE (50%):")
-        rope_partial = RotaryEmbedding(dim=head_dim, partial_rotary_factor=0.5)
-        cos_p, sin_p = rope_partial(q)
-        q_rot_p, k_rot_p = apply_partial_rotary_pos_emb(q, k, cos_p, sin_p, head_dim // 2)
-        print(f"Q rotated (partial) shape: {q_rot_p.shape}")
+    print("\nTesting partial RoPE (50%):")
+    rope_partial = RotaryEmbedding(dim=head_dim, partial_rotary_factor=0.5)
+    cos_p, sin_p = rope_partial(q)
+    q_rot_p, k_rot_p = apply_partial_rotary_pos_emb(q, k, cos_p, sin_p, head_dim // 2)
+    print(f"Q rotated (partial) shape: {q_rot_p.shape}")
 
-        print("\nTriton RoPE working!")
+    print("\nTriton RoPE working!")

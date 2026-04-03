@@ -245,7 +245,7 @@ def load_weights_from_hf_model(model, hf_model) -> None:
     print("Weight loading complete!")
 
 
-def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
+def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512", torch_dtype=torch.float16, low_cpu_mem_usage=True):
     """
     Load GLM-ASR model from HuggingFace and create Triton version.
     """

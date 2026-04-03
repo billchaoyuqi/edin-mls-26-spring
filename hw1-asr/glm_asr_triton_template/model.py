@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 # Import Triton components
 from layers import (
-    RMSNorm, LayerNorm, Linear, Embedding, MLP,
+    RMSNorm, LayerNorm, Linear, Embedding, MLP, EncoderMLP, FusedQKVLinear,
     gelu, silu, softmax, get_stream
 )
 from rope import RotaryEmbedding, apply_rotary_pos_emb
@@ -80,11 +80,13 @@ class AudioEncoderLayer:
         self.q_proj = Linear(hidden_size, hidden_size, bias=True)
         self.k_proj = Linear(hidden_size, hidden_size, bias=True)
         self.v_proj = Linear(hidden_size, hidden_size, bias=True)
+        #self.fused_qkv = FusedQKVLinear(self.q_proj, self.k_proj, self.v_proj)
         self.out_proj = Linear(hidden_size, hidden_size, bias=True)
 
-        # MLP
-        self.fc1 = Linear(hidden_size, intermediate_size, bias=True)
-        self.fc2 = Linear(intermediate_size, hidden_size, bias=True)
+        # MLP (fused linear+gelu+linear)
+        self.encoder_mlp = EncoderMLP(hidden_size, intermediate_size, bias=True)
+        self.fc1 = self.encoder_mlp.fc1
+        self.fc2 = self.encoder_mlp.fc2
 
     def __call__(
         self,
@@ -124,9 +126,7 @@ class AudioEncoderLayer:
         # MLP with pre-norm
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = gelu(hidden_states)
-        hidden_states = self.fc2(hidden_states)
+        hidden_states = self.encoder_mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -230,6 +230,7 @@ class DecoderLayer:
         self.k_proj = Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
         self.v_proj = Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
         self.o_proj = Linear(num_heads * self.head_dim, hidden_size, bias=False)
+        self.fused_qkv = FusedQKVLinear(self.q_proj, self.k_proj, self.v_proj)
 
         # MLP (SwiGLU)
         self.mlp = MLP(
@@ -729,138 +730,105 @@ class GlmAsrModel:
         max_new_tokens: int = 256,
         temperature: float = 1.0,
         top_k: int = 50,
-        audio_pad_token_id: int = 59260  # <|pad|> token for audio
+        audio_pad_token_id: int = 59260,
     ) -> torch.Tensor:
-        """Generate tokens from audio with proper chat template format.
+        """Generate tokens using pre-allocated KV cache (forward_with_kv_buffers).
 
-        Args:
-            input_features: (batch, mel_bins, time) mel spectrogram
-            input_ids: (batch, seq_len) token IDs with audio placeholders (<|pad|>)
-            input_features_mask: (batch, time) mask for valid audio frames
-            attention_mask: (batch, seq_len) attention mask
-            max_new_tokens: Maximum new tokens to generate
-            temperature: Sampling temperature
-            top_k: Top-k sampling parameter
-            audio_pad_token_id: Token ID for audio placeholders
-
-        Returns:
-            Generated token IDs
+        Prefill: process [audio + prompt tokens] in one shot.
+        Decode:  each step feeds only the 1 new token — O(1) per step vs O(n).
         """
-        # Encode audio
-        audio_embeds = self.encode_audio(input_features, input_features_mask)
+        device = input_features.device
 
+        # ── 1. Encode audio ──────────────────────────────────────────────────
+        audio_embeds = self.encode_audio(input_features, input_features_mask)
+        if audio_embeds.ndim == 3:
+            audio_embeds = audio_embeds[0]  # (seq, hidden)
+
+        # ── 2. Build prefill embeddings ──────────────────────────────────────
         if input_ids is not None:
             batch_size = input_ids.shape[0]
-
-            # Handle batch dimension for audio embeddings
-            if audio_embeds.ndim == 3:
-                # (batch, seq, hidden) -> (seq, hidden) for single batch
-                audio_embeds = audio_embeds[0]
-
-            # Get text embeddings for all tokens
-            text_embeds = self.text_decoder.embed_tokens(input_ids)
-
-            # Find audio placeholder positions and INSERT audio embeddings
-            # Note: We INSERT all audio embeddings at the first pad position,
-            # rather than replacing pad tokens 1-to-1
+            text_embeds = self.text_decoder.embed_tokens(input_ids)  # (B, T, H)
             audio_mask = (input_ids == audio_pad_token_id)
             audio_positions = torch.where(audio_mask[0])[0]
-
             if len(audio_positions) > 0:
-                # Find the first and last pad positions
-                first_pad_pos = int(audio_positions[0].item())
-                last_pad_pos = int(audio_positions[-1].item())
-
-                # Split text embeddings: before pads, after pads
-                before_audio = text_embeds[0, :first_pad_pos, :]  # (first_pad_pos, hidden)
-                after_audio = text_embeds[0, last_pad_pos + 1:, :]  # (remaining, hidden)
-
-                # Concatenate: [before] + [audio_embeds] + [after]
+                first_pad = int(audio_positions[0].item())
+                last_pad  = int(audio_positions[-1].item())
+                before = text_embeds[0, :first_pad, :]
+                after  = text_embeds[0, last_pad + 1:, :]
                 inputs_embeds = torch.cat(
-                    [
-                        before_audio[None, :, :],
-                        audio_embeds[None, :, :],
-                        after_audio[None, :, :],
-                    ],
-                    dim=1,
+                    [before[None], audio_embeds[None], after[None]], dim=1
                 )
             else:
-                # No pad tokens - just use text embeddings
                 inputs_embeds = text_embeds
-
-            # Track generated tokens (start from input_ids)
             generated = input_ids.clone()
-
         else:
-            # No input_ids - use simple concatenation (legacy mode)
-            batch_size = audio_embeds.shape[0] if audio_embeds.ndim == 3 else 1
-            if audio_embeds.ndim == 2:
-                audio_embeds = audio_embeds[None, :, :]
-            inputs_embeds = audio_embeds
+            batch_size = 1
+            inputs_embeds = audio_embeds[None]
             generated = torch.full(
-                (batch_size, 1),
-                self.config.bos_token_id,
-                dtype=torch.int64,
-                device=inputs_embeds.device,
+                (batch_size, 1), self.config.bos_token_id,
+                dtype=torch.int64, device=device,
             )
 
-        # Track which sequences have finished (hit EOS)
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=generated.device)
+        prefill_len = inputs_embeds.shape[1]
+        # inputs_embeds stays float32
 
-        # Handle single or multiple EOS token IDs
+        # ── 3. Allocate KV buffers for all 28 decoder layers ─────────────────
+        max_seq = prefill_len + max_new_tokens + 16
+        kv_buffers = self.text_decoder.allocate_kv_buffers(
+            batch_size=batch_size, max_seq_len=max_seq,
+            dtype=torch.float32,
+        )
+
+        # ── 4. Prefill — process full context, fill KV cache ─────────────────
+        hidden, cache_pos = self.text_decoder.forward_with_kv_buffers(
+            inputs_embeds, kv_buffers, cache_pos=0
+        )
+        logits = self.lm_head(hidden[:, -1:, :])
+        next_token_logits = logits[:, -1, :] / temperature
+
+        # ── 5. Sample first token ─────────────────────────────────────────────
         eos_token_ids = self.config.eos_token_id
         if isinstance(eos_token_ids, int):
             eos_token_ids = [eos_token_ids]
-        eos_token_ids_cp = torch.tensor(
-            eos_token_ids, dtype=torch.int64, device=generated.device
+        eos_ids_t = torch.tensor(eos_token_ids, dtype=torch.int64, device=device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        def _sample(logits_1d_batch):
+            if top_k > 0 and top_k < logits_1d_batch.shape[-1]:
+                topk_idx = torch.argsort(logits_1d_batch, dim=-1)[:, -top_k:]
+                topk_l   = torch.gather(logits_1d_batch, -1, topk_idx)
+                topk_l   = topk_l - topk_l.max(dim=-1, keepdim=True).values
+                probs    = torch.softmax(topk_l, dim=-1)
+                cum      = torch.cumsum(probs, dim=-1)
+                s        = torch.rand((batch_size, 1), device=device)
+                idx      = torch.argmax((cum >= s).float(), dim=-1)
+                return torch.gather(topk_idx, -1, idx[:, None])
+            return torch.argmax(logits_1d_batch, dim=-1, keepdim=True)
+
+        next_token = _sample(next_token_logits)
+        generated = torch.cat([generated, next_token], dim=1)
+        finished   = finished | torch.any(
+            next_token.flatten()[:, None] == eos_ids_t[None, :], dim=1
         )
 
-        # Autoregressive generation
-        for _ in range(max_new_tokens):
-            # Get logits for next token
-            logits = self.decode(inputs_embeds=inputs_embeds)
-            next_token_logits = logits[:, -1, :] / temperature
-
-            # Top-k sampling
-            if top_k > 0 and top_k < next_token_logits.shape[-1]:
-                top_k_indices = torch.argsort(next_token_logits, dim=-1)[:, -top_k:]
-                top_k_logits = torch.gather(next_token_logits, dim=-1, index=top_k_indices)
-
-                # Softmax
-                top_k_logits_shifted = top_k_logits - torch.max(
-                    top_k_logits, dim=-1, keepdim=True
-                ).values
-                exp_logits = torch.exp(top_k_logits_shifted)
-                probs = exp_logits / torch.sum(exp_logits, dim=-1, keepdim=True)
-
-                # Sample
-                cumprobs = torch.cumsum(probs, dim=-1)
-                samples = torch.rand((batch_size, 1), device=next_token_logits.device)
-                next_token_idx = torch.argmax((cumprobs >= samples).to(torch.float32), dim=-1)
-                next_token = torch.gather(
-                    top_k_indices,
-                    dim=-1,
-                    index=next_token_idx[:, None],
-                )
-            else:
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-
-            # Append to generated
-            generated = torch.cat([generated, next_token], dim=1)
-
-            # Check for EOS - mark sequences that generated any EOS token
-            next_token_flat = next_token.flatten()
-            is_eos = torch.any(
-                next_token_flat[:, None] == eos_token_ids_cp[None, :], dim=1
-            )
-            finished = finished | is_eos
-
-            # Stop if all sequences have finished
+        # ── 6. Decode loop — ONE token in, ONE token out ──────────────────────
+        for _ in range(max_new_tokens - 1):
             if torch.all(finished):
                 break
 
-            # Update inputs_embeds with new token
-            new_embeds = self.text_decoder.embed_tokens(next_token)
-            inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
+            # Embed just the 1 new token
+            new_embeds = self.text_decoder.embed_tokens(next_token)# (B,1,H)
+
+            # Forward through decoder with KV buffer — only processes 1 token
+            hidden, cache_pos = self.text_decoder.forward_with_kv_buffers(
+                new_embeds, kv_buffers, cache_pos=cache_pos
+            )
+            next_token_logits = self.lm_head(hidden)[:, -1, :] / temperature
+            next_token = _sample(next_token_logits)
+
+            generated = torch.cat([generated, next_token], dim=1)
+            finished  = finished | torch.any(
+                next_token.flatten()[:, None] == eos_ids_t[None, :], dim=1
+            )
 
         return generated

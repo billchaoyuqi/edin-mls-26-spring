@@ -1,0 +1,30 @@
+
+========================================================================
+SECTION 3.3 + 4.1 — Per-Kernel Timing and Arithmetic Intensity
+========================================================================
+GPU             : NVIDIA H200 MIG 1g.18gb
+Peak FP32       : 6.1 TFLOPS (estimated)
+Memory BW       : 4800 GB/s (estimated)
+Ridge point     : 1 FLOPs/Byte
+  Kernels with AI < ridge → memory-bound
+  Kernels with AI > ridge → compute-bound
+
+Kernel                                    ms    AI (F/B)  Bound         Dims
+--------------------------------------------------------------------------------
+rmsnorm_kernel                        0.0090        0.37  Memory    B=56,H=3584
+layernorm_kernel                      0.0160        0.62  Memory    B=512,H=1280
+gelu_kernel                           0.0149        1.00  Memory    N=655360
+silu_kernel                           0.0200        0.50  Memory    N=1060864
+softmax_kernel                        0.0493        0.50  Memory    56×32000
+linear_tf32 (small M=56)              0.0795       27.15  Compute ★  56×3584×3584
+linear_tf32 (large M=512)             0.6628      170.67  Compute ★  512×1280×5120
+attention (Encoder)                   0.0297       16.00  Compute ★  H=20,Sq=128
+attention GQA (Decoder)               0.0383       11.49  Compute ★  H=28/KH=4
+compute_freqs_kernel                  0.0063        0.25  Memory    S=57,D=128
+
+★ = compute-bound (AI > ridge point)
+→ Paste 'ms' column into §3.3 and 'AI + Bound' columns into §4.1.
+
+========================================================================
+Profiling complete. Copy the tables into §3.3, §4.1, §5.1, §5.2, §6.3.
+========================================================================
