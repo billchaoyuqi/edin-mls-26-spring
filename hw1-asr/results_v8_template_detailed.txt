@@ -1,0 +1,57 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+======================================================================
+GLM-ASR Detailed Operator Profiling
+======================================================================
+
+Loading test audio...
+Audio: 3.50s @ 16000Hz
+
+Loading model from glm_asr_triton_template...
+Loading HuggingFace model: zai-org/GLM-ASR-Nano-2512
+Creating Triton model with config:
+  Audio: hidden=1280, heads=20, layers=32
+  Text: hidden=2048, heads=16, kv_heads=4, layers=28
+Loading HuggingFace weights...
+Loading weights:   0%|          | 0/745 [00:00<?, ?it/s]Loading weights:  15%|█▌        | 113/745 [00:00<00:00, 1045.39it/s]Loading weights:  29%|██▉       | 218/745 [00:00<00:00, 667.26it/s] Loading weights:  39%|███▉      | 292/745 [00:00<00:00, 639.71it/s]Loading weights:  48%|████▊     | 360/745 [00:00<00:00, 606.31it/s]Loading weights:  57%|█████▋    | 423/745 [00:00<00:00, 596.51it/s]Loading weights:  65%|██████▍   | 484/745 [00:00<00:00, 569.46it/s]Loading weights:  73%|███████▎  | 542/745 [00:01<00:00, 208.23it/s]Loading weights:  78%|███████▊  | 584/745 [00:01<00:00, 183.93it/s]Loading weights:  83%|████████▎ | 617/745 [00:02<00:00, 169.89it/s]Loading weights:  86%|████████▋ | 644/745 [00:02<00:00, 160.92it/s]Loading weights:  90%|████████▉ | 667/745 [00:02<00:00, 159.38it/s]Loading weights:  92%|█████████▏| 688/745 [00:02<00:00, 152.26it/s]Loading weights:  95%|█████████▍| 706/745 [00:02<00:00, 147.35it/s]Loading weights:  97%|█████████▋| 724/745 [00:02<00:00, 142.20it/s]Loading weights: 100%|█████████▉| 743/745 [00:02<00:00, 150.27it/s]Loading weights: 100%|██████████| 745/745 [00:02<00:00, 249.82it/s]
+Loading audio encoder weights...
+Loading multi-modal projector weights...
+Loading text decoder weights...
+Weight loading complete!
+Input features shape: torch.Size([1, 128, 3000])
+Input IDs shape: torch.Size([1, 59])
+
+======================================================================
+DETAILED OPERATOR PROFILING (TORCH)
+======================================================================
+
+[1/4] Profiling Audio Encoder...
+  Audio Encoder: 2320.89ms (+/- 2910.81ms)
+
+[2/4] Profiling Multi-modal Projector...
+  Projector: 438.72ms (+/- 616.82ms)
+
+[3/4] Profiling Text Decoder (Prefill)...
+  Decoder Prefill: 1058.29ms (+/- 1463.48ms)
+
+[4/4] Profiling Decode Steps...
+  Decode Step (avg): 991.30ms (+/- 2904.19ms)
+
+[5] Profiling Individual Decoder Layers...
+  Layer 0: 1.34ms (+/- 0.04ms)
+  Layer 1: 1.35ms (+/- 0.04ms)
+  Layer 2: 1.33ms (+/- 0.03ms)
+  Layer 3: 1.33ms (+/- 0.02ms)
+  Layer 4: 1.31ms (+/- 0.01ms)
+
+======================================================================
+PERFORMANCE SUMMARY
+======================================================================
+
+Component                              Time (ms)   % of Total
+------------------------------------------------------------
+Audio Encoder                          2320.89ms        4.3%
+Multi-modal Projector                   438.72ms        0.8%
+Decoder (Prefill)                      1058.29ms        2.0%
+Decoder (50 decode steps)             49565.11ms       92.8%
+------------------------------------------------------------
+TOTAL (estimated for 50 tokens)       53383.01ms

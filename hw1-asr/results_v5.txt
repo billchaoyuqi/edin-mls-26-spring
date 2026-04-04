@@ -1,0 +1,19 @@
+======================================================================
+GLM-ASR Student Version Benchmark
+======================================================================
+
+Loading test audio...
+Loaded audio from /home/s2820897/edin-mls-26-spring/hw1-asr/test_audio.wav
+Audio duration: 3.50s
+Expected: CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS
+
+======================================================================
+Testing: glm_asr_triton_template
+======================================================================
+Loading model from glm_asr_triton_template...
+Loading HuggingFace model: zai-org/GLM-ASR-Nano-2512
+Creating Triton model with config:
+  Audio: hidden=1280, heads=20, layers=32
+  Text: hidden=2048, heads=16, kv_heads=4, layers=28
+Loading HuggingFace weights...
+Loading weights:   0%|          | 0/745 [00:00<?, ?it/s]Loading weights:   1%|          | 4/745 [00:00<01:38,  7.55it/s]Loading weights:   1%|          | 8/745 [00:00<01:16,  9.64it/s]Loading weights:   3%|▎         | 23/745 [00:01<00:43, 16.60it/s]Loading weights:   3%|▎         | 25/745 [00:01<00:47, 15.23it/s]Loading weights:   5%|▌         | 38/745 [00:02<00:33, 21.21it/s]Loading weights:   5%|▌         | 40/745 [00:02<00:37, 19.00it/s]Loading weights:   7%|▋         | 53/745 [00:03<00:36, 19.12it/s]Loading weights:   9%|▉         | 68/745 [00:03<00:30, 22.52it/s]Loading weights:  10%|▉         | 71/745 [00:03<00:30, 21.91it/s]Loading weights:  11%|█         | 83/745 [00:04<00:32, 20.32it/s]Loading weights:  13%|█▎        | 98/745 [00:04<00:27, 23.14it/s]Loading weights:  14%|█▎        | 101/745 [00:05<00:28, 22.52it/s]Loading weights:  15%|█▌        | 113/745 [00:05<00:30, 20.73it/s]

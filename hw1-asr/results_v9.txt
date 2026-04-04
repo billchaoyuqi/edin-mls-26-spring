@@ -1,0 +1,43 @@
+======================================================================
+GLM-ASR Student Version Benchmark
+======================================================================
+
+Loading test audio...
+Loaded audio from /home/s2820897/edin-mls-26-spring/hw1-asr/test_audio.wav
+Audio duration: 3.50s
+Expected: CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS
+
+======================================================================
+Testing: glm_asr_triton_template
+======================================================================
+Loading model from glm_asr_triton_template...
+Loading HuggingFace model: zai-org/GLM-ASR-Nano-2512
+Creating Triton model with config:
+  Audio: hidden=1280, heads=20, layers=32
+  Text: hidden=2048, heads=16, kv_heads=4, layers=28
+Loading HuggingFace weights...
+Loading weights:   0%|          | 0/745 [00:00<?, ?it/s]Loading weights:   1%|          | 4/745 [00:00<01:52,  6.57it/s]Loading weights:   1%|          | 8/745 [00:00<01:14,  9.88it/s]Loading weights:   3%|▎         | 23/745 [00:01<00:42, 16.85it/s]Loading weights:   3%|▎         | 25/745 [00:01<00:44, 16.02it/s]Loading weights:   5%|▌         | 38/745 [00:02<00:33, 20.90it/s]Loading weights:   7%|▋         | 53/745 [00:02<00:33, 20.77it/s]Loading weights:   7%|▋         | 55/745 [00:03<00:34, 19.80it/s]Loading weights:   9%|▉         | 68/745 [00:03<00:29, 22.75it/s]Loading weights:  11%|█         | 83/745 [00:04<00:30, 21.47it/s]Loading weights:  12%|█▏        | 86/745 [00:04<00:30, 21.43it/s]Loading weights:  13%|█▎        | 98/745 [00:04<00:28, 23.09it/s]Loading weights:  15%|█▌        | 113/745 [00:05<00:28, 22.01it/s]Loading weights:  16%|█▌        | 116/745 [00:05<00:29, 21.54it/s]Loading weights:  17%|█▋        | 128/745 [00:06<00:26, 23.35it/s]Loading weights:  19%|█▉        | 143/745 [00:06<00:27, 21.91it/s]Loading weights:  20%|█▉        | 146/745 [00:07<00:27, 22.02it/s]Loading weights:  21%|██        | 158/745 [00:07<00:25, 22.93it/s]Loading weights:  23%|██▎       | 173/745 [00:08<00:26, 21.68it/s]Loading weights:  24%|██▎       | 176/745 [00:08<00:26, 21.73it/s]Loading weights:  25%|██▌       | 188/745 [00:08<00:24, 22.96it/s]Loading weights:  27%|██▋       | 203/745 [00:09<00:25, 21.46it/s]Loading weights:  28%|██▊       | 206/745 [00:09<00:24, 21.77it/s]Loading weights:  29%|██▉       | 218/745 [00:10<00:23, 22.89it/s]Loading weights:  31%|███▏      | 233/745 [00:11<00:23, 21.42it/s]Loading weights:  32%|███▏      | 237/745 [00:11<00:22, 22.81it/s]Loading weights:  33%|███▎      | 248/745 [00:11<00:21, 22.78it/s]Loading weights:  35%|███▌      | 263/745 [00:12<00:22, 21.42it/s]Loading weights:  36%|███▌      | 266/745 [00:12<00:21, 21.90it/s]Loading weights:  37%|███▋      | 278/745 [00:12<00:20, 23.33it/s]Loading weights:  39%|███▉      | 293/745 [00:13<00:20, 21.75it/s]Loading weights:  40%|███▉      | 296/745 [00:13<00:20, 21.76it/s]Loading weights:  41%|████▏     | 308/745 [00:14<00:18, 23.14it/s]Loading weights:  43%|████▎     | 323/745 [00:15<00:19, 21.77it/s]Loading weights:  44%|████▍     | 326/745 [00:15<00:19, 21.45it/s]Loading weights:  45%|████▌     | 338/745 [00:15<00:17, 23.44it/s]Loading weights:  47%|████▋     | 353/745 [00:16<00:18, 21.74it/s]Loading weights:  48%|████▊     | 356/745 [00:16<00:17, 22.05it/s]Loading weights:  49%|████▉     | 368/745 [00:17<00:16, 22.90it/s]Loading weights:  51%|█████▏    | 383/745 [00:17<00:16, 21.74it/s]Loading weights:  52%|█████▏    | 386/745 [00:17<00:16, 22.02it/s]Loading weights:  53%|█████▎    | 398/745 [00:18<00:15, 23.03it/s]Loading weights:  55%|█████▌    | 413/745 [00:19<00:15, 21.72it/s]Loading weights:  56%|█████▌    | 416/745 [00:19<00:15, 21.85it/s]Loading weights:  57%|█████▋    | 428/745 [00:19<00:13, 23.21it/s]Loading weights:  59%|█████▉    | 443/745 [00:20<00:13, 21.91it/s]Loading weights:  60%|█████▉    | 446/745 [00:20<00:13, 22.13it/s]Loading weights:  61%|██████▏   | 458/745 [00:21<00:12, 23.39it/s]Loading weights:  63%|██████▎   | 473/745 [00:21<00:12, 21.76it/s]Loading weights:  64%|██████▍   | 476/745 [00:21<00:12, 22.06it/s]Loading weights:  65%|██████▌   | 487/745 [00:37<02:17,  1.87it/s]Loading weights:  66%|██████▌   | 488/745 [00:38<02:12,  1.94it/s]Loading weights:  71%|███████   | 528/745 [00:38<00:33,  6.46it/s]Loading weights:  72%|███████▏  | 535/745 [00:39<00:33,  6.18it/s]Loading weights:  73%|███████▎  | 544/745 [00:41<00:33,  5.95it/s]Loading weights:  74%|███████▍  | 553/745 [00:42<00:32,  5.99it/s]Loading weights:  75%|███████▍  | 556/745 [00:43<00:30,  6.25it/s]Loading weights:  75%|███████▌  | 562/745 [00:44<00:32,  5.65it/s]Loading weights:  76%|███████▌  | 564/745 [00:44<00:31,  5.77it/s]Loading weights:  77%|███████▋  | 571/745 [00:46<00:32,  5.44it/s]Loading weights:  78%|███████▊  | 580/745 [00:48<00:31,  5.29it/s]Loading weights:  79%|███████▉  | 589/745 [00:49<00:27,  5.62it/s]Loading weights:  79%|███████▉  | 590/745 [00:49<00:28,  5.43it/s]Loading weights:  80%|████████  | 598/745 [00:51<00:26,  5.50it/s]Loading weights:  81%|████████  | 600/745 [00:51<00:25,  5.59it/s]Loading weights:  81%|████████▏ | 607/745 [00:53<00:25,  5.32it/s]Loading weights:  83%|████████▎ | 616/745 [00:54<00:24,  5.28it/s]Loading weights:  84%|████████▍ | 625/745 [00:56<00:22,  5.38it/s]Loading weights:  84%|████████▍ | 626/745 [00:56<00:22,  5.32it/s]Loading weights:  85%|████████▌ | 634/745 [00:58<00:21,  5.27it/s]Loading weights:  85%|████████▌ | 636/745 [00:58<00:19,  5.59it/s]Loading weights:  86%|████████▋ | 643/745 [00:59<00:19,  5.28it/s]Loading weights:  88%|████████▊ | 652/745 [01:01<00:17,  5.43it/s]Loading weights:  89%|████████▊ | 661/745 [01:03<00:16,  5.20it/s]Loading weights:  89%|████████▉ | 662/745 [01:03<00:15,  5.29it/s]Loading weights:  90%|████████▉ | 670/745 [01:04<00:14,  5.17it/s]Loading weights:  90%|█████████ | 672/745 [01:05<00:13,  5.43it/s]Loading weights:  91%|█████████ | 679/745 [01:06<00:13,  4.90it/s]Loading weights:  91%|█████████▏| 681/745 [01:07<00:11,  5.41it/s]Loading weights:  92%|█████████▏| 688/745 [01:08<00:11,  4.90it/s]Loading weights:  93%|█████████▎| 690/745 [01:08<00:10,  5.46it/s]Loading weights:  94%|█████████▎| 697/745 [01:10<00:09,  4.88it/s]Loading weights:  94%|█████████▍| 699/745 [01:10<00:08,  5.35it/s]Loading weights:  95%|█████████▍| 706/745 [01:12<00:08,  4.76it/s]Loading weights:  95%|█████████▌| 708/745 [01:12<00:07,  5.20it/s]Loading weights:  96%|█████████▌| 715/745 [01:14<00:06,  4.71it/s]Loading weights:  96%|█████████▌| 717/745 [01:14<00:05,  5.17it/s]Loading weights:  97%|█████████▋| 724/745 [01:16<00:04,  4.60it/s]Loading weights:  97%|█████████▋| 726/745 [01:16<00:03,  5.19it/s]Loading weights:  98%|█████████▊| 733/745 [01:17<00:02,  4.86it/s]Loading weights:  99%|█████████▊| 734/745 [01:17<00:02,  5.03it/s]Loading weights: 100%|█████████▉| 743/745 [01:20<00:00,  4.37it/s]Loading weights: 100%|██████████| 745/745 [01:20<00:00,  9.30it/s]
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading audio encoder weights...
+Loading multi-modal projector weights...
+Loading text decoder weights...
+Weight loading complete!
+Using generate function: generate
+Warmup (1 runs)...
+Benchmarking (3 runs)...
+  Run 1: 2583.1ms (100 tokens)
+  Run 2: 2547.5ms (100 tokens)
+  Run 3: 2581.2ms (100 tokens)
+
+======================================================================
+RESULTS
+======================================================================
+Time: 2570.6ms (+/- 16.4ms)
+Tokens: 100
+Speed: 25.71ms/token
+
+Transcription: 
+
+Accuracy: 0.0%
+Status: FAIL - Transcription does not match expected
+Expected: CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS
